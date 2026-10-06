@@ -1,0 +1,73 @@
+{
+  "name": "margix-inventory",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "build:workers": "node scripts/build-workers.mjs",
+    "start": "next start",
+    "lint": "eslint",
+    "typecheck": "next typegen && tsc --noEmit",
+    "postinstall": "prisma generate && node scripts/copy-vendor-assets.mjs",
+    "db:up": "podman start margix-postgres",
+    "db:migrate": "prisma migrate dev",
+    "db:deploy": "prisma migrate deploy && npm run db:grants",
+    "db:reset": "prisma migrate reset --force --skip-seed && npm run db:grants && npm run db:seed",
+    "db:seed": "prisma db seed",
+    "test": "dotenv -e .env.test -- vitest run",
+    "test:watch": "dotenv -e .env.test -- vitest",
+    "test:e2e": "playwright test",
+    "tally:sync": "tsx --env-file=.env scripts/tally-sync.ts",
+    "notify:run": "tsx --env-file=.env scripts/notify.ts",
+    "integration:new": "node scripts/new-integration.mjs",
+    "db:grants": "tsx --env-file=.env scripts/db-grants.ts",
+    "db:backup": "ops/backup/backup.sh",
+    "db:verify-backup": "ops/backup/verify-restore.sh"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.22.0",
+    "barcode-detector": "^3.2.2",
+    "bwip-js": "^4.11.4",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "date-fns": "^4.4.0",
+    "lucide-react": "^1.47.0",
+    "next": "16.3.5",
+    "nodemailer": "^10.0.10",
+    "pg": "^8.23.0",
+    "qrcode": "^1.5.4",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "recharts": "^3.10.1",
+    "tailwind-merge": "^3.7.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "@tailwindcss/postcss": "^4.3.3",
+    "@types/node": "^22.20.4",
+    "@types/nodemailer": "^8.0.2",
+    "@types/pg": "^8.23.1",
+    "@types/qrcode": "^1.5.6",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "babel-plugin-react-compiler": "1.0.0",
+    "dotenv-cli": "^11.0.0",
+    "esbuild": "0.28.2",
+    "eslint": "^9",
+    "eslint-config-next": "16.3.5",
+    "postcss": "^8.5.28",
+    "prisma": "^5.22.0",
+    "tailwindcss": "^4.3.3",
+    "tsx": "^4.23.15",
+    "typescript": "^5",
+    "vitest": "^5.0.1"
+  },
+  "engines": {
+    "node": ">=22 <23"
+  },
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
+  }
+}

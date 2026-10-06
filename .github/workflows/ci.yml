@@ -1,0 +1,228 @@
+name: CI
+
+# Every push (any branch) and every pull request from a fork. Pull requests
+# from branches of this repository are already covered by their push run.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NEXT_TELEMETRY_DISABLED: 1
+
+jobs:
+  check:
+    name: Lint, typecheck, test, build
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: margix
+          POSTGRES_PASSWORD: margix
+          POSTGRES_DB: margix_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U margix -d margix_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+
+    env:
+      PGPASSWORD: margix
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Prepare test database
+        run: |
+          psql -h 127.0.0.1 -U margix -d margix_test -v ON_ERROR_STOP=1 \
+            -c "CREATE ROLE margix_app LOGIN PASSWORD 'margix_app_dev'" \
+            -c "CREATE DATABASE margix_shadow"
+          cat > .env.test <<'ENV'
+          DATABASE_URL="postgresql://margix:margix@127.0.0.1:5432/margix_test?schema=public&connection_limit=20"
+          DIRECT_DATABASE_URL="postgresql://margix:margix@127.0.0.1:5432/margix_test?schema=public"
+          APP_DATABASE_URL="postgresql://margix_app:margix_app_dev@127.0.0.1:5432/margix_test?schema=public"
+          SESSION_TTL_HOURS=12
+          TALLY_MODE=mock
+          LOG_LEVEL=warn
+          ENV
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # Fails when schema.prisma changed without a matching migration.
+      - name: Check migrations match the schema
+        run: >-
+          npx prisma migrate diff
+          --from-migrations prisma/migrations
+          --to-schema-datamodel prisma/schema.prisma
+          --shadow-database-url "postgresql://margix:margix@127.0.0.1:5432/margix_shadow"
+          --exit-code
+
+      - name: Test
+        run: npm test
+
+      - name: Restore Next.js build cache
+        uses: actions/cache@v4
+        with:
+          path: .next/cache
+          key: next-${{ runner.os }}-${{ hashFiles('package-lock.json') }}-${{ hashFiles('src/**', 'next.config.ts') }}
+          restore-keys: next-${{ runner.os }}-${{ hashFiles('package-lock.json') }}-
+
+      - name: Build
+        run: npm run build
+
+      - name: Bundle background workers
+        run: npm run build:workers
+
+  e2e:
+    name: End-to-end (Playwright)
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: margix
+          POSTGRES_PASSWORD: margix
+          POSTGRES_DB: margix_e2e
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U margix -d margix_e2e"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+
+    env:
+      E2E_DATABASE_URL: postgresql://margix:margix@127.0.0.1:5432/margix_e2e?schema=public
+      # `next build` only needs a syntactically valid URL; E2E runs use E2E_DATABASE_URL.
+      DATABASE_URL: postgresql://margix:margix@127.0.0.1:5432/margix_e2e?schema=public
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Install browser
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: npx playwright install --with-deps chromium
+
+      - name: Install browser system dependencies
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: npx playwright install-deps chromium
+
+      - name: Build
+        run: npm run build
+
+      - name: Run E2E tests
+        run: npm run test:e2e
+
+      - name: Upload report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 7
+
+  security:
+    name: Dependency audit
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      # Production dependencies with a known high or critical vulnerability fail the build.
+      - name: npm audit (production dependencies)
+        run: npm audit --omit=dev --audit-level=high
+
+  dependency-review:
+    name: Dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+          comment-summary-in-pr: on-failure
+
+  image:
+    name: Container images build
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build app image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: app
+          tags: margix-ims:ci
+          push: false
+          cache-from: type=gha,scope=app
+          cache-to: type=gha,mode=max,scope=app
+
+      - name: Build tools image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: tools
+          tags: margix-ims-tools:ci
+          push: false
+          cache-from: type=gha,scope=tools
+          cache-to: type=gha,mode=max,scope=tools

@@ -1,0 +1,1324 @@
+// Margix IMS — V1 schema.
+//
+// Core rule: stock is never edited. Every change is an immutable row in
+// `inventory_ledger` with a SIGNED quantity (sign enforced by a DB CHECK per
+// movement type). `stock_balance` is a projection maintained in the same
+// transaction as each ledger insert. Constraints, triggers and views that
+// Prisma cannot model live in the migration SQL (see migrations/*_init).
+
+generator client {
+  provider      = "prisma-client-js"
+  /// native = this machine; debian-openssl-3.0.x = the production containers,
+  /// so an app built on the host (deploy/deploy.sh) also runs in them.
+  binaryTargets = ["native", "debian-openssl-3.0.x"]
+}
+
+datasource db {
+  provider  = "postgresql"
+  /// Runtime connection (least-privilege app login in production).
+  url       = env("DATABASE_URL")
+  /// Schema owner, used by Prisma Migrate only.
+  directUrl = env("DIRECT_DATABASE_URL")
+}
+
+// ==========================
+// Enums
+// ==========================
+
+enum RoleCode {
+  ADMIN
+  STORE_MANAGER
+  WAREHOUSE_OPERATOR
+  ACCOUNTS
+  MANAGEMENT
+}
+
+enum MovementType {
+  OPENING
+  INWARD
+  OUTWARD
+  TRANSFER_IN
+  TRANSFER_OUT
+  RETURN_IN
+  RETURN_OUT
+  ADJUSTMENT
+  REVERSAL
+}
+
+enum ReferenceType {
+  OPENING_BALANCE
+  GRN
+  DISPATCH
+  ADJUSTMENT
+  TRANSFER
+  SALES_RETURN
+  PURCHASE_RETURN
+}
+
+enum AdjustmentReason {
+  DAMAGE
+  THEFT
+  EXPIRY
+  COUNTING_ERROR
+  OTHER
+}
+
+enum AdjustmentStatus {
+  SUBMITTED
+  APPROVED
+  REJECTED
+  REVERSED
+}
+
+enum PurchaseOrderStatus {
+  DRAFT
+  OPEN
+  PARTIALLY_RECEIVED
+  FULLY_RECEIVED
+  /// Closed early: nothing more will be received against it.
+  SHORT_CLOSED
+  CANCELLED
+}
+
+enum InvoiceStatus {
+  OPEN
+  PARTIALLY_DISPATCHED
+  COMPLETE
+  CANCELLED
+}
+
+enum StockAlertStatus {
+  ACTIVE
+  RESOLVED
+}
+
+enum PostedDocStatus {
+  POSTED
+  PARTIALLY_REVERSED
+  REVERSED
+}
+
+enum SkuStatus {
+  ACTIVE
+  INACTIVE
+  ARCHIVED
+}
+
+/// GST treatment of a priced document: CGST + SGST within a state, IGST across states.
+enum TaxType {
+  INTRA
+  INTER
+}
+
+enum TallySyncStatus {
+  PENDING
+  IN_PROGRESS
+  SYNCED
+  FAILED
+}
+
+enum TallyEntityType {
+  OPENING_BALANCE
+  GRN
+  DISPATCH
+  ADJUSTMENT
+  REVERSAL
+  TRANSFER
+  SALES_RETURN
+  PURCHASE_RETURN
+}
+
+// ==========================
+// Access
+// ==========================
+
+model Role {
+  id        String   @id @default(uuid()) @db.Uuid
+  code      RoleCode @unique
+  name      String
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  users     User[]
+
+  @@map("role")
+}
+
+model User {
+  id                String    @id @default(uuid()) @db.Uuid
+  name              String
+  email             String    @unique
+  mobile            String?
+  passwordHash      String    @map("password_hash")
+  roleId            String    @map("role_id") @db.Uuid
+  role              Role      @relation(fields: [roleId], references: [id])
+  isActive          Boolean   @default(true) @map("is_active")
+  failedLoginCount  Int       @default(0) @map("failed_login_count")
+  lockedUntil       DateTime? @map("locked_until") @db.Timestamptz(3)
+  passwordChangedAt DateTime? @map("password_changed_at") @db.Timestamptz(3)
+  lastLoginAt       DateTime? @map("last_login_at") @db.Timestamptz(3)
+  createdAt         DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  sessions             Session[]
+  purchaseOrders       PurchaseOrder[]           @relation("PoCreatedBy")
+  cancelledPos         PurchaseOrder[]           @relation("PoCancelledBy")
+  closedPos            PurchaseOrder[]           @relation("PoClosedBy")
+  invoicesCreated      Invoice[]                 @relation("InvoiceCreatedBy")
+  invoicesCancelled    Invoice[]                 @relation("InvoiceCancelledBy")
+  transfers            Transfer[]
+  salesReturns         SalesReturn[]
+  purchaseReturns      PurchaseReturn[]
+  grns                 Grn[]
+  outwards             Outward[]
+  openingBalances      OpeningBalance[]
+  adjustmentsCreated   Adjustment[]              @relation("AdjCreatedBy")
+  adjustmentsSubmitted Adjustment[]              @relation("AdjSubmittedBy")
+  adjustmentsReviewed  Adjustment[]              @relation("AdjReviewedBy")
+  ledgerEntries        InventoryLedger[]
+  auditLogs            AuditLog[]
+  codeSeriesUpdates    CodeSeries[]              @relation("CodeSeriesUpdatedBy")
+  webhookEndpoints     WebhookEndpoint[]         @relation("WebhookEndpointCreatedBy")
+  notifications        Notification[]
+  checklistCompletions ChecklistTaskCompletion[]
+  checklistViews       ChecklistView[]
+  checklistTasks       ChecklistTask[]           @relation("ChecklistTaskCreatedBy")
+
+  @@map("app_user")
+}
+
+model Session {
+  /// sha256(token) as hex. The raw token only ever lives in the cookie.
+  id         String   @id
+  userId     String   @map("user_id") @db.Uuid
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt  DateTime @map("expires_at") @db.Timestamptz(3)
+  lastSeenAt DateTime @default(now()) @map("last_seen_at") @db.Timestamptz(3)
+  ipAddress  String?  @map("ip_address")
+  userAgent  String?  @map("user_agent")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("session")
+}
+
+// ==========================
+// Master data
+// ==========================
+
+model Category {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String   @unique
+  isActive  Boolean  @default(true) @map("is_active")
+  /// Default HSN for products in this category (suggested on new products).
+  hsnCode   String?  @map("hsn_code")
+  hsn       HsnCode? @relation(fields: [hsnCode], references: [code], onDelete: Restrict, onUpdate: Cascade)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  skus      Sku[]
+
+  @@map("category")
+}
+
+/// Central HSN (goods) / SAC (services) master with the applicable GST rate.
+/// Products and categories reference it; documents copy the rate at posting.
+model HsnCode {
+  /// 4, 6 or 8 digits.
+  code        String     @id
+  description String
+  gstRate     Decimal    @map("gst_rate") @db.Decimal(5, 2)
+  /// Extra search words (trade names, synonyms) used by suggestions.
+  keywords    String?
+  isActive    Boolean    @default(true) @map("is_active")
+  createdAt   DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+  skus        Sku[]
+  categories  Category[]
+
+  @@map("hsn_code")
+}
+
+model Uom {
+  id            String   @id @default(uuid()) @db.Uuid
+  code          String   @unique
+  name          String
+  /// Maximum decimal places allowed for quantities in this unit (0..3).
+  decimalPlaces Int      @default(0) @map("decimal_places")
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  skus          Sku[]
+
+  skuUnits           SkuUnit[]
+  purchaseOrderItems PurchaseOrderItem[]
+  invoiceItems       InvoiceItem[]
+
+  @@map("uom")
+}
+
+model Sku {
+  id                 String    @id @default(uuid()) @db.Uuid
+  code               String    @unique
+  name               String
+  description        String?
+  categoryId         String?   @map("category_id") @db.Uuid
+  category           Category? @relation(fields: [categoryId], references: [id])
+  baseUomId          String    @map("base_uom_id") @db.Uuid
+  baseUom            Uom       @relation(fields: [baseUomId], references: [id])
+  hsnCode            String?   @map("hsn_code")
+  hsn                HsnCode?  @relation(fields: [hsnCode], references: [code], onDelete: Restrict, onUpdate: Cascade)
+  /// Applied GST rate: the HSN's rate unless deliberately overridden.
+  gstRate            Decimal?  @map("gst_rate") @db.Decimal(5, 2)
+  /// When false, all stock lives in the system batch named DEFAULT.
+  isBatchTracked     Boolean   @default(true) @map("is_batch_tracked")
+  status             SkuStatus @default(ACTIVE)
+  tallyStockItemName String?   @map("tally_stock_item_name")
+  /// Product barcode (EAN-13 or any Code 128 value); scanned to find the product.
+  barcode            String?   @unique
+  createdAt          DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  batches             Batch[]
+  ledgerEntries       InventoryLedger[]
+  stockBalances       StockBalance[]
+  purchaseOrderItems  PurchaseOrderItem[]
+  grnItems            GrnItem[]
+  outwardItems        OutwardItem[]
+  openingItems        OpeningBalanceItem[]
+  adjustmentItems     AdjustmentItem[]
+  invoiceItems        InvoiceItem[]
+  transferItems       TransferItem[]
+  salesReturnItems    SalesReturnItem[]
+  purchaseReturnItems PurchaseReturnItem[]
+  reorderRules        ReorderRule[]
+  stockAlerts         StockAlert[]
+
+  units SkuUnit[]
+
+  @@index([status])
+  @@map("sku")
+}
+
+/// Alternate unit of a SKU, e.g. BOX with factor 24 when the base unit is PCS.
+model SkuUnit {
+  id        String   @id @default(uuid()) @db.Uuid
+  skuId     String   @map("sku_id") @db.Uuid
+  sku       Sku      @relation(fields: [skuId], references: [id])
+  uomId     String   @map("uom_id") @db.Uuid
+  uom       Uom      @relation(fields: [uomId], references: [id])
+  /// Base units in one of this unit.
+  factor    Decimal  @db.Decimal(18, 6)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([skuId, uomId])
+  @@map("sku_unit")
+}
+
+model Batch {
+  id                String    @id @default(uuid()) @db.Uuid
+  skuId             String    @map("sku_id") @db.Uuid
+  sku               Sku       @relation(fields: [skuId], references: [id])
+  batchNumber       String    @map("batch_number")
+  manufacturingDate DateTime? @map("manufacturing_date") @db.Date
+  expiryDate        DateTime? @map("expiry_date") @db.Date
+  createdAt         DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  ledgerEntries       InventoryLedger[]
+  stockBalances       StockBalance[]
+  grnItems            GrnItem[]
+  outwardItems        OutwardItem[]
+  openingItems        OpeningBalanceItem[]
+  adjustmentItems     AdjustmentItem[]
+  transferItems       TransferItem[]
+  salesReturnItems    SalesReturnItem[]
+  purchaseReturnItems PurchaseReturnItem[]
+
+  @@unique([skuId, batchNumber])
+  /// Target of composite foreign keys that guarantee a batch belongs to the line's SKU.
+  @@unique([id, skuId])
+  @@index([expiryDate])
+  @@map("batch")
+}
+
+model Godown {
+  id               String   @id @default(uuid()) @db.Uuid
+  code             String   @unique
+  name             String
+  address          String?
+  isActive         Boolean  @default(true) @map("is_active")
+  /// When false, movements in this godown are never queued for Tally.
+  tallySyncEnabled Boolean  @default(true) @map("tally_sync_enabled")
+  tallyGodownName  String?  @map("tally_godown_name")
+  createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  ledgerEntries   InventoryLedger[]
+  stockBalances   StockBalance[]
+  grns            Grn[]
+  outwards        Outward[]
+  openingBalances OpeningBalance[]
+  adjustments     Adjustment[]
+  reorderRules    ReorderRule[]
+  stockAlerts     StockAlert[]
+  transfersOut    Transfer[]        @relation("TransferFrom")
+  transfersIn     Transfer[]        @relation("TransferTo")
+  salesReturns    SalesReturn[]
+  purchaseReturns PurchaseReturn[]
+
+  @@map("godown")
+}
+
+model Supplier {
+  id              String           @id @default(uuid()) @db.Uuid
+  code            String           @unique
+  name            String
+  gstin           String?
+  /// Two-digit GST state code; used when there is no GSTIN (the GSTIN's own state wins).
+  stateCode       String?          @map("state_code")
+  email           String?
+  phone           String?
+  address         String?
+  isActive        Boolean          @default(true) @map("is_active")
+  createdAt       DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  purchaseOrders  PurchaseOrder[]
+  purchaseReturns PurchaseReturn[]
+
+  @@map("supplier")
+}
+
+model Customer {
+  id           String        @id @default(uuid()) @db.Uuid
+  code         String        @unique
+  name         String
+  gstin        String?
+  /// Two-digit GST state code; used when there is no GSTIN (the GSTIN's own state wins).
+  stateCode    String?       @map("state_code")
+  email        String?
+  phone        String?
+  address      String?
+  isActive     Boolean       @default(true) @map("is_active")
+  createdAt    DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  outwards     Outward[]
+  invoices     Invoice[]
+  salesReturns SalesReturn[]
+
+  @@map("customer")
+}
+
+// ==========================
+// Procurement
+// ==========================
+
+model PurchaseOrder {
+  id                String              @id @default(uuid()) @db.Uuid
+  poNumber          String              @unique @map("po_number")
+  supplierId        String              @map("supplier_id") @db.Uuid
+  supplier          Supplier            @relation(fields: [supplierId], references: [id])
+  status            PurchaseOrderStatus @default(DRAFT)
+  orderDate         DateTime            @map("order_date") @db.Date
+  expectedDate      DateTime?           @map("expected_date") @db.Date
+  remarks           String?
+  /// Fixed when the order is saved (supplier state vs company state); master edits never change it.
+  taxType           TaxType             @default(INTRA) @map("tax_type")
+  /// GST state code where the goods are delivered (the company's state); null when unknown.
+  placeOfSupply     String?             @map("place_of_supply")
+  /// Freight, packing etc.: added after tax, not taxed.
+  otherCharges      Decimal             @default(0) @map("other_charges") @db.Decimal(18, 2)
+  otherChargesLabel String?             @map("other_charges_label")
+  idempotencyKey    String?             @unique @map("idempotency_key")
+  createdById       String              @map("created_by_id") @db.Uuid
+  createdBy         User                @relation("PoCreatedBy", fields: [createdById], references: [id])
+  submittedAt       DateTime?           @map("submitted_at") @db.Timestamptz(3)
+  cancelledAt       DateTime?           @map("cancelled_at") @db.Timestamptz(3)
+  cancelledById     String?             @map("cancelled_by_id") @db.Uuid
+  cancelledBy       User?               @relation("PoCancelledBy", fields: [cancelledById], references: [id])
+  cancelReason      String?             @map("cancel_reason")
+  closedAt          DateTime?           @map("closed_at") @db.Timestamptz(3)
+  closedById        String?             @map("closed_by_id") @db.Uuid
+  closedBy          User?               @relation("PoClosedBy", fields: [closedById], references: [id])
+  closeReason       String?             @map("close_reason")
+  createdAt         DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  items PurchaseOrderItem[]
+  grns  Grn[]
+
+  @@index([status])
+  @@index([supplierId])
+  @@map("purchase_order")
+}
+
+model PurchaseOrderItem {
+  id              String        @id @default(uuid()) @db.Uuid
+  purchaseOrderId String        @map("purchase_order_id") @db.Uuid
+  purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  lineNo          Int           @map("line_no")
+  skuId           String        @map("sku_id") @db.Uuid
+  sku             Sku           @relation(fields: [skuId], references: [id])
+  orderedQty      Decimal       @map("ordered_qty") @db.Decimal(18, 3)
+  /// As entered when an alternate unit was used: unit, quantity and factor at the time.
+  entryUomId      String?       @map("entry_uom_id") @db.Uuid
+  entryUom        Uom?          @relation(fields: [entryUomId], references: [id], onDelete: Restrict)
+  entryQuantity   Decimal?      @map("entry_quantity") @db.Decimal(18, 3)
+  entryFactor     Decimal?      @map("entry_factor") @db.Decimal(18, 6)
+  /// Accepted quantity received so far, net of reversals. Maintained in-transaction.
+  receivedQty     Decimal       @default(0) @map("received_qty") @db.Decimal(18, 3)
+  /// Price per entered unit (entryUom when set, otherwise the base unit).
+  rate            Decimal?      @db.Decimal(18, 2)
+  /// Trade discount on the line, percent of quantity × rate (0–100).
+  discountPercent Decimal       @default(0) @map("discount_percent") @db.Decimal(5, 2)
+  gstRate         Decimal?      @map("gst_rate") @db.Decimal(5, 2)
+  /// The product's HSN code when the line was saved.
+  hsnCode         String?       @map("hsn_code")
+
+  grnItems GrnItem[]
+
+  @@unique([purchaseOrderId, skuId])
+  @@unique([purchaseOrderId, lineNo])
+  @@map("purchase_order_item")
+}
+
+model Grn {
+  id                String          @id @default(uuid()) @db.Uuid
+  grnNumber         String          @unique @map("grn_number")
+  purchaseOrderId   String          @map("purchase_order_id") @db.Uuid
+  purchaseOrder     PurchaseOrder   @relation(fields: [purchaseOrderId], references: [id])
+  godownId          String          @map("godown_id") @db.Uuid
+  godown            Godown          @relation(fields: [godownId], references: [id])
+  receivedAt        DateTime        @map("received_at") @db.Timestamptz(3)
+  supplierInvoiceNo String?         @map("supplier_invoice_no")
+  remarks           String?
+  status            PostedDocStatus @default(POSTED)
+  idempotencyKey    String?         @unique @map("idempotency_key")
+  createdById       String          @map("created_by_id") @db.Uuid
+  createdBy         User            @relation(fields: [createdById], references: [id])
+  createdAt         DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  items           GrnItem[]
+  purchaseReturns PurchaseReturn[]
+
+  @@index([purchaseOrderId])
+  @@index([createdAt])
+  @@map("grn")
+}
+
+model GrnItem {
+  id                  String               @id @default(uuid()) @db.Uuid
+  grnId               String               @map("grn_id") @db.Uuid
+  grn                 Grn                  @relation(fields: [grnId], references: [id])
+  purchaseOrderItemId String               @map("purchase_order_item_id") @db.Uuid
+  purchaseOrderItem   PurchaseOrderItem    @relation(fields: [purchaseOrderItemId], references: [id])
+  skuId               String               @map("sku_id") @db.Uuid
+  sku                 Sku                  @relation(fields: [skuId], references: [id])
+  batchId             String               @map("batch_id") @db.Uuid
+  batch               Batch                @relation(fields: [batchId, skuId], references: [id, skuId])
+  receivedQty         Decimal              @map("received_qty") @db.Decimal(18, 3)
+  acceptedQty         Decimal              @map("accepted_qty") @db.Decimal(18, 3)
+  rejectedQty         Decimal              @map("rejected_qty") @db.Decimal(18, 3)
+  rejectionReason     String?              @map("rejection_reason")
+  /// Accepted quantity sent back to the supplier (purchase returns), net of reversals.
+  returnedQty         Decimal              @default(0) @map("returned_qty") @db.Decimal(18, 3)
+  /// Null when nothing was accepted.
+  ledgerEntryId       String?              @unique @map("ledger_entry_id") @db.Uuid
+  ledgerEntry         InventoryLedger?     @relation("GrnItemEntry", fields: [ledgerEntryId], references: [id])
+  purchaseReturnItems PurchaseReturnItem[]
+
+  @@index([grnId])
+  @@map("grn_item")
+}
+
+// ==========================
+// Outward (dispatch)
+// ==========================
+
+model Outward {
+  id             String          @id @default(uuid()) @db.Uuid
+  outwardNumber  String          @unique @map("outward_number")
+  godownId       String          @map("godown_id") @db.Uuid
+  godown         Godown          @relation(fields: [godownId], references: [id])
+  customerId     String?         @map("customer_id") @db.Uuid
+  customer       Customer?       @relation(fields: [customerId], references: [id])
+  /// Set when the dispatch fulfils (part of) an invoice.
+  invoiceId      String?         @map("invoice_id") @db.Uuid
+  invoice        Invoice?        @relation(fields: [invoiceId], references: [id])
+  dispatchedAt   DateTime        @map("dispatched_at") @db.Timestamptz(3)
+  vehicleNo      String?         @map("vehicle_no")
+  referenceNo    String?         @map("reference_no")
+  remarks        String?
+  status         PostedDocStatus @default(POSTED)
+  idempotencyKey String?         @unique @map("idempotency_key")
+  createdById    String          @map("created_by_id") @db.Uuid
+  createdBy      User            @relation(fields: [createdById], references: [id])
+  createdAt      DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  items        OutwardItem[]
+  salesReturns SalesReturn[]
+
+  @@index([createdAt])
+  @@index([invoiceId])
+  @@map("outward")
+}
+
+model OutwardItem {
+  id               String            @id @default(uuid()) @db.Uuid
+  outwardId        String            @map("outward_id") @db.Uuid
+  outward          Outward           @relation(fields: [outwardId], references: [id])
+  skuId            String            @map("sku_id") @db.Uuid
+  sku              Sku               @relation(fields: [skuId], references: [id])
+  batchId          String            @map("batch_id") @db.Uuid
+  batch            Batch             @relation(fields: [batchId, skuId], references: [id, skuId])
+  quantity         Decimal           @db.Decimal(18, 3)
+  invoiceItemId    String?           @map("invoice_item_id") @db.Uuid
+  invoiceItem      InvoiceItem?      @relation(fields: [invoiceItemId], references: [id])
+  /// Quantity returned by the customer (sales returns), net of reversals.
+  returnedQty      Decimal           @default(0) @map("returned_qty") @db.Decimal(18, 3)
+  ledgerEntryId    String            @unique @map("ledger_entry_id") @db.Uuid
+  ledgerEntry      InventoryLedger   @relation("OutwardItemEntry", fields: [ledgerEntryId], references: [id])
+  salesReturnItems SalesReturnItem[]
+
+  @@index([outwardId])
+  @@index([invoiceItemId])
+  @@map("outward_item")
+}
+
+// ==========================
+// Opening balances
+// ==========================
+
+model OpeningBalance {
+  id             String          @id @default(uuid()) @db.Uuid
+  openingNumber  String          @unique @map("opening_number")
+  godownId       String          @map("godown_id") @db.Uuid
+  godown         Godown          @relation(fields: [godownId], references: [id])
+  asOf           DateTime        @map("as_of") @db.Date
+  remarks        String?
+  status         PostedDocStatus @default(POSTED)
+  idempotencyKey String?         @unique @map("idempotency_key")
+  createdById    String          @map("created_by_id") @db.Uuid
+  createdBy      User            @relation(fields: [createdById], references: [id])
+  createdAt      DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  items OpeningBalanceItem[]
+
+  @@map("opening_balance")
+}
+
+model OpeningBalanceItem {
+  id               String              @id @default(uuid()) @db.Uuid
+  openingBalanceId String              @map("opening_balance_id") @db.Uuid
+  openingBalance   OpeningBalance      @relation(fields: [openingBalanceId], references: [id])
+  skuId            String              @map("sku_id") @db.Uuid
+  sku              Sku                 @relation(fields: [skuId], references: [id])
+  batchId          String              @map("batch_id") @db.Uuid
+  batch            Batch               @relation(fields: [batchId, skuId], references: [id, skuId])
+  quantity         Decimal             @db.Decimal(18, 3)
+  ledgerEntryId    String              @unique @map("ledger_entry_id") @db.Uuid
+  ledgerEntry      InventoryLedger     @relation("OpeningItemEntry", fields: [ledgerEntryId], references: [id])
+  /// Set when this line corrects an earlier opening line (which was reversed).
+  replacesItemId   String?             @unique @map("replaces_item_id") @db.Uuid
+  replaces         OpeningBalanceItem? @relation("OpeningItemCorrection", fields: [replacesItemId], references: [id], onDelete: Restrict)
+  replacedBy       OpeningBalanceItem? @relation("OpeningItemCorrection")
+
+  @@index([openingBalanceId])
+  @@map("opening_balance_item")
+}
+
+// ==========================
+// Adjustments (maker / checker)
+// ==========================
+
+model Adjustment {
+  id               String           @id @default(uuid()) @db.Uuid
+  adjustmentNumber String           @unique @map("adjustment_number")
+  godownId         String           @map("godown_id") @db.Uuid
+  godown           Godown           @relation(fields: [godownId], references: [id])
+  reasonCode       AdjustmentReason @map("reason_code")
+  reasonNote       String?          @map("reason_note")
+  status           AdjustmentStatus @default(SUBMITTED)
+  createdById      String           @map("created_by_id") @db.Uuid
+  createdBy        User             @relation("AdjCreatedBy", fields: [createdById], references: [id])
+  submittedById    String           @map("submitted_by_id") @db.Uuid
+  submittedBy      User             @relation("AdjSubmittedBy", fields: [submittedById], references: [id])
+  submittedAt      DateTime         @map("submitted_at") @db.Timestamptz(3)
+  reviewedById     String?          @map("reviewed_by_id") @db.Uuid
+  reviewedBy       User?            @relation("AdjReviewedBy", fields: [reviewedById], references: [id])
+  reviewedAt       DateTime?        @map("reviewed_at") @db.Timestamptz(3)
+  reviewNote       String?          @map("review_note")
+  idempotencyKey   String?          @unique @map("idempotency_key")
+  createdAt        DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime         @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  items AdjustmentItem[]
+
+  @@index([status, createdAt])
+  @@map("adjustment")
+}
+
+model AdjustmentItem {
+  id            String           @id @default(uuid()) @db.Uuid
+  adjustmentId  String           @map("adjustment_id") @db.Uuid
+  adjustment    Adjustment       @relation(fields: [adjustmentId], references: [id])
+  skuId         String           @map("sku_id") @db.Uuid
+  sku           Sku              @relation(fields: [skuId], references: [id])
+  batchId       String           @map("batch_id") @db.Uuid
+  batch         Batch            @relation(fields: [batchId, skuId], references: [id, skuId])
+  /// Signed: negative reduces stock, positive increases it. Never zero.
+  quantity      Decimal          @db.Decimal(18, 3)
+  /// Set when the adjustment is approved and posted.
+  ledgerEntryId String?          @unique @map("ledger_entry_id") @db.Uuid
+  ledgerEntry   InventoryLedger? @relation("AdjustmentItemEntry", fields: [ledgerEntryId], references: [id])
+
+  @@index([adjustmentId])
+  @@map("adjustment_item")
+}
+
+// ==========================
+// Inventory ledger (source of truth) and stock projection
+// ==========================
+
+model InventoryLedger {
+  id              String            @id @default(uuid()) @db.Uuid
+  /// Monotonic total order of entries; shown to users as LE-000123.
+  entryNo         BigInt            @unique @default(autoincrement()) @map("entry_no")
+  skuId           String            @map("sku_id") @db.Uuid
+  sku             Sku               @relation(fields: [skuId], references: [id])
+  godownId        String            @map("godown_id") @db.Uuid
+  godown          Godown            @relation(fields: [godownId], references: [id])
+  batchId         String            @map("batch_id") @db.Uuid
+  batch           Batch             @relation(fields: [batchId, skuId], references: [id, skuId])
+  movementType    MovementType      @map("movement_type")
+  /// SIGNED quantity. Stock = SUM(quantity).
+  quantity        Decimal           @db.Decimal(18, 3)
+  /// Stock of (sku, godown, batch) immediately after this entry.
+  balanceAfter    Decimal           @map("balance_after") @db.Decimal(18, 3)
+  referenceType   ReferenceType     @map("reference_type")
+  /// Id of the source document (Grn, Outward, Adjustment, OpeningBalance).
+  referenceId     String            @map("reference_id") @db.Uuid
+  referenceNo     String            @map("reference_no")
+  referenceLineId String?           @map("reference_line_id") @db.Uuid
+  reasonCode      AdjustmentReason? @map("reason_code")
+  remarks         String?
+  reversesEntryId String?           @unique @map("reverses_entry_id") @db.Uuid
+  reversesEntry   InventoryLedger?  @relation("Reversal", fields: [reversesEntryId], references: [id])
+  reversedBy      InventoryLedger?  @relation("Reversal")
+  createdById     String            @map("created_by_id") @db.Uuid
+  createdBy       User              @relation(fields: [createdById], references: [id])
+  createdAt       DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  grnItem            GrnItem?            @relation("GrnItemEntry")
+  outwardItem        OutwardItem?        @relation("OutwardItemEntry")
+  openingItem        OpeningBalanceItem? @relation("OpeningItemEntry")
+  adjustmentItem     AdjustmentItem?     @relation("AdjustmentItemEntry")
+  transferOutItem    TransferItem?       @relation("TransferOutEntry")
+  transferInItem     TransferItem?       @relation("TransferInEntry")
+  salesReturnItem    SalesReturnItem?    @relation("SalesReturnItemEntry")
+  purchaseReturnItem PurchaseReturnItem? @relation("PurchaseReturnItemEntry")
+
+  @@index([skuId, godownId, batchId, createdAt])
+  @@index([godownId, createdAt])
+  @@index([batchId])
+  @@index([movementType, createdAt])
+  @@index([referenceType, referenceId])
+  @@index([createdAt])
+  @@map("inventory_ledger")
+}
+
+model StockBalance {
+  skuId     String   @map("sku_id") @db.Uuid
+  sku       Sku      @relation(fields: [skuId], references: [id])
+  godownId  String   @map("godown_id") @db.Uuid
+  godown    Godown   @relation(fields: [godownId], references: [id])
+  batchId   String   @map("batch_id") @db.Uuid
+  batch     Batch    @relation(fields: [batchId, skuId], references: [id, skuId])
+  quantity  Decimal  @default(0) @db.Decimal(18, 3)
+  updatedAt DateTime @default(now()) @map("updated_at") @db.Timestamptz(3)
+
+  @@id([skuId, godownId, batchId])
+  @@index([godownId])
+  @@index([batchId])
+  @@map("stock_balance")
+}
+
+/// Admin-customised code series (numbering master). Series without a row use
+/// the defaults in src/lib/numbering.ts. Counters live in document_sequence.
+model CodeSeries {
+  /// Series key, e.g. "SKU", "INV" (see CODE_SERIES).
+  key         String   @id
+  prefix      String
+  pattern     String
+  padding     Int
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  updatedById String   @map("updated_by_id") @db.Uuid
+  updatedBy   User     @relation("CodeSeriesUpdatedBy", fields: [updatedById], references: [id])
+
+  @@map("code_series")
+}
+
+model DocumentSequence {
+  /// Series key + period, e.g. "PO:2026", "INV:2627" or "SKU:ALL".
+  key       String @id
+  lastValue Int    @map("last_value")
+
+  @@map("document_sequence")
+}
+
+// ==========================
+// Tally integration
+// ==========================
+
+model TallySyncJob {
+  id             String          @id @default(uuid()) @db.Uuid
+  entityType     TallyEntityType @map("entity_type")
+  entityId       String          @map("entity_id") @db.Uuid
+  entityNo       String          @map("entity_no")
+  status         TallySyncStatus @default(PENDING)
+  attempts       Int             @default(0)
+  nextAttemptAt  DateTime        @default(now()) @map("next_attempt_at") @db.Timestamptz(3)
+  lockedUntil    DateTime?       @map("locked_until") @db.Timestamptz(3)
+  lastError      String?         @map("last_error")
+  tallyVoucherId String?         @map("tally_voucher_id")
+  syncedAt       DateTime?       @map("synced_at") @db.Timestamptz(3)
+  createdAt      DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  logs TallySyncLog[]
+
+  @@unique([entityType, entityId])
+  @@index([status, nextAttemptAt])
+  @@map("tally_sync_job")
+}
+
+model TallySyncLog {
+  id         String          @id @default(uuid()) @db.Uuid
+  jobId      String          @map("job_id") @db.Uuid
+  job        TallySyncJob    @relation(fields: [jobId], references: [id])
+  attemptNo  Int             @map("attempt_no")
+  status     TallySyncStatus
+  error      String?
+  durationMs Int?            @map("duration_ms")
+  createdAt  DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([jobId])
+  @@map("tally_sync_log")
+}
+
+// ==========================
+// Audit
+// ==========================
+
+model AuditLog {
+  id         String   @id @default(uuid()) @db.Uuid
+  userId     String?  @map("user_id") @db.Uuid
+  user       User?    @relation(fields: [userId], references: [id])
+  action     String
+  entityType String   @map("entity_type")
+  entityId   String?  @map("entity_id")
+  oldData    Json?    @map("old_data")
+  newData    Json?    @map("new_data")
+  ipAddress  String?  @map("ip_address")
+  userAgent  String?  @map("user_agent")
+  requestId  String?  @map("request_id")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([entityType, entityId])
+  @@index([userId, createdAt])
+  @@index([action, createdAt])
+  @@index([createdAt])
+  @@map("audit_log")
+}
+
+// ==========================
+// Sales: invoices
+// ==========================
+
+model Invoice {
+  id                String        @id @default(uuid()) @db.Uuid
+  invoiceNumber     String        @unique @map("invoice_number")
+  customerId        String        @map("customer_id") @db.Uuid
+  customer          Customer      @relation(fields: [customerId], references: [id])
+  invoiceDate       DateTime      @map("invoice_date") @db.Date
+  status            InvoiceStatus @default(OPEN)
+  remarks           String?
+  /// Fixed when the invoice is created (customer state vs company state); master edits never change it.
+  taxType           TaxType       @default(INTRA) @map("tax_type")
+  /// GST state code of the place of supply (the customer's state); null when unknown.
+  placeOfSupply     String?       @map("place_of_supply")
+  /// Freight, packing etc.: added after tax, not taxed.
+  otherCharges      Decimal       @default(0) @map("other_charges") @db.Decimal(18, 2)
+  otherChargesLabel String?       @map("other_charges_label")
+  idempotencyKey    String?       @unique @map("idempotency_key")
+  createdById       String        @map("created_by_id") @db.Uuid
+  createdBy         User          @relation("InvoiceCreatedBy", fields: [createdById], references: [id])
+  cancelledAt       DateTime?     @map("cancelled_at") @db.Timestamptz(3)
+  cancelledById     String?       @map("cancelled_by_id") @db.Uuid
+  cancelledBy       User?         @relation("InvoiceCancelledBy", fields: [cancelledById], references: [id])
+  cancelReason      String?       @map("cancel_reason")
+  createdAt         DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  items    InvoiceItem[]
+  outwards Outward[]
+
+  @@index([status])
+  @@index([customerId])
+  @@map("invoice")
+}
+
+model InvoiceItem {
+  id              String   @id @default(uuid()) @db.Uuid
+  invoiceId       String   @map("invoice_id") @db.Uuid
+  invoice         Invoice  @relation(fields: [invoiceId], references: [id])
+  lineNo          Int      @map("line_no")
+  skuId           String   @map("sku_id") @db.Uuid
+  sku             Sku      @relation(fields: [skuId], references: [id])
+  quantity        Decimal  @db.Decimal(18, 3)
+  /// As entered when an alternate unit was used: unit, quantity and factor at the time.
+  entryUomId      String?  @map("entry_uom_id") @db.Uuid
+  entryUom        Uom?     @relation(fields: [entryUomId], references: [id], onDelete: Restrict)
+  entryQuantity   Decimal? @map("entry_quantity") @db.Decimal(18, 3)
+  entryFactor     Decimal? @map("entry_factor") @db.Decimal(18, 6)
+  /// Dispatched against this line, net of reversals. Maintained in-transaction.
+  dispatchedQty   Decimal  @default(0) @map("dispatched_qty") @db.Decimal(18, 3)
+  /// Price per entered unit (entryUom when set, otherwise the base unit).
+  rate            Decimal? @db.Decimal(18, 2)
+  /// Trade discount on the line, percent of quantity × rate (0–100).
+  discountPercent Decimal  @default(0) @map("discount_percent") @db.Decimal(5, 2)
+  gstRate         Decimal? @map("gst_rate") @db.Decimal(5, 2)
+  /// The product's HSN code when the line was saved.
+  hsnCode         String?  @map("hsn_code")
+
+  outwardItems OutwardItem[]
+
+  @@unique([invoiceId, skuId])
+  @@unique([invoiceId, lineNo])
+  @@map("invoice_item")
+}
+
+// ==========================
+// Transfers between godowns
+// ==========================
+
+model Transfer {
+  id             String          @id @default(uuid()) @db.Uuid
+  transferNumber String          @unique @map("transfer_number")
+  fromGodownId   String          @map("from_godown_id") @db.Uuid
+  fromGodown     Godown          @relation("TransferFrom", fields: [fromGodownId], references: [id])
+  toGodownId     String          @map("to_godown_id") @db.Uuid
+  toGodown       Godown          @relation("TransferTo", fields: [toGodownId], references: [id])
+  transferredAt  DateTime        @map("transferred_at") @db.Timestamptz(3)
+  remarks        String?
+  status         PostedDocStatus @default(POSTED)
+  idempotencyKey String?         @unique @map("idempotency_key")
+  createdById    String          @map("created_by_id") @db.Uuid
+  createdBy      User            @relation(fields: [createdById], references: [id])
+  createdAt      DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  items TransferItem[]
+
+  @@index([createdAt])
+  @@map("transfer")
+}
+
+/// One line moves one batch; it posts a TRANSFER_OUT and a TRANSFER_IN entry.
+model TransferItem {
+  id         String          @id @default(uuid()) @db.Uuid
+  transferId String          @map("transfer_id") @db.Uuid
+  transfer   Transfer        @relation(fields: [transferId], references: [id])
+  skuId      String          @map("sku_id") @db.Uuid
+  sku        Sku             @relation(fields: [skuId], references: [id])
+  batchId    String          @map("batch_id") @db.Uuid
+  batch      Batch           @relation(fields: [batchId, skuId], references: [id, skuId])
+  quantity   Decimal         @db.Decimal(18, 3)
+  outEntryId String          @unique @map("out_entry_id") @db.Uuid
+  outEntry   InventoryLedger @relation("TransferOutEntry", fields: [outEntryId], references: [id])
+  inEntryId  String          @unique @map("in_entry_id") @db.Uuid
+  inEntry    InventoryLedger @relation("TransferInEntry", fields: [inEntryId], references: [id])
+
+  @@index([transferId])
+  @@map("transfer_item")
+}
+
+// ==========================
+// Returns
+// ==========================
+
+/// Goods coming back from a customer, always against a dispatch.
+model SalesReturn {
+  id             String          @id @default(uuid()) @db.Uuid
+  returnNumber   String          @unique @map("return_number")
+  outwardId      String          @map("outward_id") @db.Uuid
+  outward        Outward         @relation(fields: [outwardId], references: [id])
+  customerId     String?         @map("customer_id") @db.Uuid
+  customer       Customer?       @relation(fields: [customerId], references: [id])
+  godownId       String          @map("godown_id") @db.Uuid
+  godown         Godown          @relation(fields: [godownId], references: [id])
+  returnedAt     DateTime        @map("returned_at") @db.Timestamptz(3)
+  reason         String
+  remarks        String?
+  status         PostedDocStatus @default(POSTED)
+  idempotencyKey String?         @unique @map("idempotency_key")
+  createdById    String          @map("created_by_id") @db.Uuid
+  createdBy      User            @relation(fields: [createdById], references: [id])
+  createdAt      DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  items SalesReturnItem[]
+
+  @@index([outwardId])
+  @@index([createdAt])
+  @@map("sales_return")
+}
+
+model SalesReturnItem {
+  id            String          @id @default(uuid()) @db.Uuid
+  salesReturnId String          @map("sales_return_id") @db.Uuid
+  salesReturn   SalesReturn     @relation(fields: [salesReturnId], references: [id])
+  outwardItemId String          @map("outward_item_id") @db.Uuid
+  outwardItem   OutwardItem     @relation(fields: [outwardItemId], references: [id])
+  skuId         String          @map("sku_id") @db.Uuid
+  sku           Sku             @relation(fields: [skuId], references: [id])
+  batchId       String          @map("batch_id") @db.Uuid
+  batch         Batch           @relation(fields: [batchId, skuId], references: [id, skuId])
+  quantity      Decimal         @db.Decimal(18, 3)
+  ledgerEntryId String          @unique @map("ledger_entry_id") @db.Uuid
+  ledgerEntry   InventoryLedger @relation("SalesReturnItemEntry", fields: [ledgerEntryId], references: [id])
+
+  @@index([salesReturnId])
+  @@map("sales_return_item")
+}
+
+/// Goods sent back to a supplier, always against a GRN.
+model PurchaseReturn {
+  id             String          @id @default(uuid()) @db.Uuid
+  returnNumber   String          @unique @map("return_number")
+  grnId          String          @map("grn_id") @db.Uuid
+  grn            Grn             @relation(fields: [grnId], references: [id])
+  supplierId     String          @map("supplier_id") @db.Uuid
+  supplier       Supplier        @relation(fields: [supplierId], references: [id])
+  godownId       String          @map("godown_id") @db.Uuid
+  godown         Godown          @relation(fields: [godownId], references: [id])
+  returnedAt     DateTime        @map("returned_at") @db.Timestamptz(3)
+  reason         String
+  remarks        String?
+  status         PostedDocStatus @default(POSTED)
+  idempotencyKey String?         @unique @map("idempotency_key")
+  createdById    String          @map("created_by_id") @db.Uuid
+  createdBy      User            @relation(fields: [createdById], references: [id])
+  createdAt      DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  items PurchaseReturnItem[]
+
+  @@index([grnId])
+  @@index([createdAt])
+  @@map("purchase_return")
+}
+
+model PurchaseReturnItem {
+  id               String          @id @default(uuid()) @db.Uuid
+  purchaseReturnId String          @map("purchase_return_id") @db.Uuid
+  purchaseReturn   PurchaseReturn  @relation(fields: [purchaseReturnId], references: [id])
+  grnItemId        String          @map("grn_item_id") @db.Uuid
+  grnItem          GrnItem         @relation(fields: [grnItemId], references: [id])
+  skuId            String          @map("sku_id") @db.Uuid
+  sku              Sku             @relation(fields: [skuId], references: [id])
+  batchId          String          @map("batch_id") @db.Uuid
+  batch            Batch           @relation(fields: [batchId, skuId], references: [id, skuId])
+  quantity         Decimal         @db.Decimal(18, 3)
+  ledgerEntryId    String          @unique @map("ledger_entry_id") @db.Uuid
+  ledgerEntry      InventoryLedger @relation("PurchaseReturnItemEntry", fields: [ledgerEntryId], references: [id])
+
+  @@index([purchaseReturnId])
+  @@map("purchase_return_item")
+}
+
+// ==========================
+// Reorder rules and alerts
+// ==========================
+
+model ReorderRule {
+  id           String   @id @default(uuid()) @db.Uuid
+  skuId        String   @map("sku_id") @db.Uuid
+  sku          Sku      @relation(fields: [skuId], references: [id])
+  godownId     String   @map("godown_id") @db.Uuid
+  godown       Godown   @relation(fields: [godownId], references: [id])
+  /// Alert when godown stock of the SKU falls below this level.
+  reorderLevel Decimal  @map("reorder_level") @db.Decimal(18, 3)
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([skuId, godownId])
+  @@map("reorder_rule")
+}
+
+/// At most one ACTIVE alert per SKU × godown × type (partial unique index in SQL).
+/// LOW_STOCK: reorder rules, evaluated on every posting. SLOW_MOVING: raised by
+/// the daily scan, resolved by the next movement of the SKU in the godown.
+model StockAlert {
+  id           String           @id @default(uuid()) @db.Uuid
+  skuId        String           @map("sku_id") @db.Uuid
+  sku          Sku              @relation(fields: [skuId], references: [id])
+  godownId     String           @map("godown_id") @db.Uuid
+  godown       Godown           @relation(fields: [godownId], references: [id])
+  alertType    String           @default("LOW_STOCK") @map("alert_type")
+  currentQty   Decimal          @map("current_qty") @db.Decimal(18, 3)
+  thresholdQty Decimal          @map("threshold_qty") @db.Decimal(18, 3)
+  status       StockAlertStatus @default(ACTIVE)
+  /// SLOW_MOVING only: whole days since the last movement, as of the last scan.
+  daysIdle     Int?             @map("days_idle")
+  createdAt    DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime         @updatedAt @map("updated_at") @db.Timestamptz(3)
+  resolvedAt   DateTime?        @map("resolved_at") @db.Timestamptz(3)
+
+  notifications NotificationOutbox[]
+
+  @@index([status, createdAt])
+  @@index([skuId, godownId, status])
+  @@map("stock_alert")
+}
+
+// ==========================
+// Settings
+// ==========================
+
+/// Admin-editable system settings, one JSON document per key, validated by
+/// zod in src/server/modules/settings. A missing key means "use defaults".
+model AppSetting {
+  key         String   @id
+  value       Json
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  updatedById String?  @map("updated_by_id") @db.Uuid
+
+  @@map("app_setting")
+}
+
+/// Once-a-day jobs of the notification worker (slow-moving scan, digests).
+/// Claiming a day is a conditional upsert, so concurrent workers never both run it.
+model ScheduledJobRun {
+  key       String   @id
+  /// IST calendar day of the last run.
+  lastRunOn DateTime @map("last_run_on") @db.Date
+  lastRunAt DateTime @map("last_run_at") @db.Timestamptz(3)
+
+  @@map("scheduled_job_run")
+}
+
+// ==========================
+// Notifications
+// ==========================
+
+enum NotificationChannel {
+  IN_APP
+  EMAIL
+  WHATSAPP
+}
+
+enum NotificationAlertType {
+  LOW_STOCK
+  SLOW_MOVING
+}
+
+enum NotificationFrequency {
+  /// Sent as soon as the alert is raised (the same transaction queues it).
+  IMMEDIATE
+  /// One summary of all active alerts per day at `digestTime` (IST).
+  DAILY_DIGEST
+}
+
+enum NotificationStatus {
+  PENDING
+  IN_PROGRESS
+  SENT
+  FAILED
+  /// The channel is not configured: recorded (log-only), never retried.
+  SKIPPED
+}
+
+/// Who is told about an alert type, how, and how often. A missing row means
+/// the built-in defaults (see notification-settings.ts).
+model NotificationRule {
+  alertType          NotificationAlertType @id @map("alert_type")
+  isEnabled          Boolean               @default(true) @map("is_enabled")
+  frequency          NotificationFrequency @default(IMMEDIATE)
+  /// "HH:MM" in IST, used when frequency = DAILY_DIGEST.
+  digestTime         String                @default("09:00") @map("digest_time")
+  inAppEnabled       Boolean               @default(true) @map("in_app_enabled")
+  emailEnabled       Boolean               @default(false) @map("email_enabled")
+  whatsappEnabled    Boolean               @default(false) @map("whatsapp_enabled")
+  /// In-app recipients: everyone with one of these roles, plus these users.
+  inAppRoles         RoleCode[]            @default([]) @map("in_app_roles")
+  inAppUserIds       String[]              @default([]) @map("in_app_user_ids") @db.Uuid
+  emailRecipients    String[]              @default([]) @map("email_recipients")
+  /// Phone numbers with country code, digits only, e.g. 919876543210.
+  whatsappRecipients String[]              @default([]) @map("whatsapp_recipients")
+  updatedAt          DateTime              @updatedAt @map("updated_at") @db.Timestamptz(3)
+  updatedById        String?               @map("updated_by_id") @db.Uuid
+
+  @@map("notification_rule")
+}
+
+/// Transactional outbox: one row per channel x recipient, written in the same
+/// transaction as the alert it reports and delivered by the notify worker
+/// (FOR UPDATE SKIP LOCKED, exponential backoff), like the Tally queue.
+model NotificationOutbox {
+  id                String                 @id @default(uuid()) @db.Uuid
+  channel           NotificationChannel
+  /// User id (IN_APP), e-mail address (EMAIL) or phone number (WHATSAPP).
+  recipient         String
+  alertType         NotificationAlertType? @map("alert_type")
+  /// Set for an immediate notification about one alert.
+  stockAlertId      String?                @map("stock_alert_id") @db.Uuid
+  stockAlert        StockAlert?            @relation(fields: [stockAlertId], references: [id])
+  subject           String
+  body              String
+  /// App path the message points to, e.g. /alerts.
+  link              String?
+  /// Channel-specific content (WhatsApp template and parameters).
+  payload           Json?
+  status            NotificationStatus     @default(PENDING)
+  attempts          Int                    @default(0)
+  nextAttemptAt     DateTime               @default(now()) @map("next_attempt_at") @db.Timestamptz(3)
+  lockedUntil       DateTime?              @map("locked_until") @db.Timestamptz(3)
+  lastError         String?                @map("last_error")
+  providerMessageId String?                @map("provider_message_id")
+  sentAt            DateTime?              @map("sent_at") @db.Timestamptz(3)
+  createdAt         DateTime               @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime               @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  attemptLogs NotificationAttempt[]
+
+  @@index([status, nextAttemptAt])
+  @@index([stockAlertId])
+  @@index([createdAt])
+  @@map("notification_outbox")
+}
+
+model NotificationAttempt {
+  id         String             @id @default(uuid()) @db.Uuid
+  outboxId   String             @map("outbox_id") @db.Uuid
+  outbox     NotificationOutbox @relation(fields: [outboxId], references: [id], onDelete: Cascade)
+  attemptNo  Int                @map("attempt_no")
+  status     NotificationStatus
+  error      String?
+  durationMs Int?               @map("duration_ms")
+  createdAt  DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([outboxId])
+  @@map("notification_attempt")
+}
+
+/// In-app notification centre (the bell). Inserting one announces a change on
+/// the live feed, so open screens refresh their unread count.
+model Notification {
+  id        String                 @id @default(uuid()) @db.Uuid
+  userId    String                 @map("user_id") @db.Uuid
+  user      User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  alertType NotificationAlertType? @map("alert_type")
+  title     String
+  body      String
+  link      String?
+  readAt    DateTime?              @map("read_at") @db.Timestamptz(3)
+  createdAt DateTime               @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([userId, readAt, createdAt])
+  @@map("notification")
+}
+
+// ==========================
+// Daily checklist
+// ==========================
+
+/// Administrator-defined daily task (e.g. "Follow up overdue customer payments").
+model ChecklistTask {
+  id          String     @id @default(uuid()) @db.Uuid
+  title       String
+  description String?
+  /// Roles the task applies to; empty = everyone.
+  roles       RoleCode[] @default([])
+  /// "HH:MM" in IST after which an unfinished task is overdue.
+  dueTime     String?    @map("due_time")
+  isActive    Boolean    @default(true) @map("is_active")
+  sortOrder   Int        @default(0) @map("sort_order")
+  createdById String     @map("created_by_id") @db.Uuid
+  createdBy   User       @relation("ChecklistTaskCreatedBy", fields: [createdById], references: [id])
+  createdAt   DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  completions ChecklistTaskCompletion[]
+
+  @@map("checklist_task")
+}
+
+/// A task ticked done by one user on one IST day.
+model ChecklistTaskCompletion {
+  taskId      String        @map("task_id") @db.Uuid
+  task        ChecklistTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  userId      String        @map("user_id") @db.Uuid
+  user        User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  day         DateTime      @db.Date
+  completedAt DateTime      @default(now()) @map("completed_at") @db.Timestamptz(3)
+
+  @@id([taskId, userId, day])
+  @@index([userId, day])
+  @@map("checklist_task_completion")
+}
+
+/// The checklist popup was shown to the user on this IST day (shown once a day).
+model ChecklistView {
+  userId String   @map("user_id") @db.Uuid
+  user   User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  day    DateTime @db.Date
+  seenAt DateTime @default(now()) @map("seen_at") @db.Timestamptz(3)
+
+  @@id([userId, day])
+  @@map("checklist_view")
+}
+
+// ==========================
+// Integrations: outbound webhooks
+// ==========================
+
+enum WebhookDeliveryStatus {
+  PENDING
+  IN_PROGRESS
+  DELIVERED
+  FAILED
+}
+
+/// Another system subscribed to Margix events (docs/integrations.md#webhooks).
+model WebhookEndpoint {
+  id          String            @id @default(uuid()) @db.Uuid
+  name        String
+  /// HTTPS URL that receives POSTed events.
+  url         String
+  /// HMAC-SHA256 signing secret; shown to the admin once (on create / rotate).
+  secret      String
+  /// Subscribed event names (see src/lib/webhook-events.ts); "*" = all events.
+  events      String[]
+  isActive    Boolean           @default(true) @map("is_active")
+  createdById String            @map("created_by_id") @db.Uuid
+  createdBy   User              @relation("WebhookEndpointCreatedBy", fields: [createdById], references: [id])
+  createdAt   DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime          @updatedAt @map("updated_at") @db.Timestamptz(3)
+  deliveries  WebhookDelivery[]
+
+  @@map("webhook_endpoint")
+}
+
+/// One event for one endpoint: queued in the transaction that caused it, delivered by the worker with retries.
+model WebhookDelivery {
+  id             String                @id @default(uuid()) @db.Uuid
+  endpointId     String                @map("endpoint_id") @db.Uuid
+  endpoint       WebhookEndpoint       @relation(fields: [endpointId], references: [id], onDelete: Cascade)
+  /// Same for every endpoint that receives this occurrence (idempotency key for receivers).
+  eventId        String                @map("event_id") @db.Uuid
+  event          String
+  payload        Json
+  status         WebhookDeliveryStatus @default(PENDING)
+  attempts       Int                   @default(0)
+  nextAttemptAt  DateTime              @default(now()) @map("next_attempt_at") @db.Timestamptz(3)
+  lockedUntil    DateTime?             @map("locked_until") @db.Timestamptz(3)
+  lastError      String?               @map("last_error")
+  responseStatus Int?                  @map("response_status")
+  deliveredAt    DateTime?             @map("delivered_at") @db.Timestamptz(3)
+  createdAt      DateTime              @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([status, nextAttemptAt])
+  @@index([endpointId, createdAt])
+  @@map("webhook_delivery")
+}
